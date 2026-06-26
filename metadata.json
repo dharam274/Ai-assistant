@@ -1,0 +1,10 @@
+{
+  "name": "Dharam Myraa AI Assistant",
+  "description": "Voice-to-voice real-time futuristic AI companion with Myraa (girl) and Dharam (boy) personality selection, real-time waveform visualization, and visual transcripts.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
