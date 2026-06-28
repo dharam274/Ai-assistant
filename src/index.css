@@ -76,6 +76,17 @@ html, body, #root {
   }
 }
 
+@keyframes bubble-slide-in {
+  0% {
+    transform: translateY(12px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
 @keyframes fade-in {
   0% {
     opacity: 0;
@@ -87,6 +98,10 @@ html, body, #root {
 
 .animate-slide-in {
   animation: slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-bubble-slide-in {
+  animation: bubble-slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 .animate-fade-in {

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, ReactNode } from "react";
 import {
   Power,
   Mic,
@@ -14,7 +14,8 @@ import {
   Globe,
   Check,
   ChevronUp,
-  Settings
+  Settings,
+  Brain
 } from "lucide-react";
 import {
   AssistantState,
@@ -23,6 +24,11 @@ import {
   TranscriptEntry
 } from "./types";
 import { AudioRecorder, PCMPlayer } from "./lib/audio";
+import { CodeBlock } from "./components/CodeBlock";
+import { SongFeaturesSearch } from "./components/SongFeaturesSearch";
+import { CreativeStudio } from "./components/CreativeStudio";
+import { MemoryVault, MemoryItem, normalizeCategory } from "./components/MemoryVault";
+import AICharacterVisualizer from "./components/AICharacterVisualizer";
 
 // Preset Atmosphere themes matching the user request
 const THEMES: ThemeConfig[] = [
@@ -92,10 +98,28 @@ export default function App() {
   // State variables
   const [connectionState, setConnectionState] = useState<AssistantState>("disconnected");
   const [character, setCharacter] = useState<CharacterType>("dharam"); // Dharam (Boy) is default, Myraa is option
+  const [animationState, setAnimationState] = useState<"idle" | "thinking" | "talking">("idle");
+
+  // Keep character animation state synchronized with connection/voice flow
+  useEffect(() => {
+    if (connectionState === "disconnected") {
+      setAnimationState("idle");
+    } else if (connectionState === "connecting") {
+      setAnimationState("thinking");
+    } else if (connectionState === "speaking") {
+      setAnimationState("talking");
+    } else if (connectionState === "listening") {
+      setAnimationState("idle");
+    }
+  }, [connectionState]);
   const [activeTheme, setActiveTheme] = useState<ThemeConfig>(THEMES[4]); // Celestial Mystic (Cyan) is default
   const [showTopicsModal, setShowTopicsModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [showSongFeatures, setShowSongFeatures] = useState(false);
+  const [showCreativeStudio, setShowCreativeStudio] = useState(false);
+  const [promptModalConfig, setPromptModalConfig] = useState<{ isOpen: boolean; type: "image" | "video" | "code"; placeholder: string; title: string } | null>(null);
+  const [customPromptText, setCustomPromptText] = useState("");
   const [chatMode, setChatMode] = useState<"writing" | "speaking" | "hybrid">("speaking");
   const [currentTime, setCurrentTime] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -106,8 +130,211 @@ export default function App() {
     setToastMessage(msg);
   };
 
-  // Transcripts state
-  const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
+  // Long-Term Memory Vault States
+  const [memories, setMemories] = useState<MemoryItem[]>(() => {
+    try {
+      const stored = localStorage.getItem("myraa_dharam_memories");
+      const parsed = stored ? JSON.parse(stored) : [];
+      return parsed.map((m: any) => ({
+        ...m,
+        category: normalizeCategory(m.category)
+      }));
+    } catch (e) {
+      console.error("Failed to load memories from localStorage:", e);
+      return [];
+    }
+  });
+  const [showMemoryVault, setShowMemoryVault] = useState(false);
+  const [isExtractingMemories, setIsExtractingMemories] = useState(false);
+
+  // Long-Term Memory Core handlers
+  const handleAddMemory = (category: MemoryItem["category"], content: string) => {
+    const newMem: MemoryItem = {
+      id: `mem-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      category,
+      content,
+      timestamp: new Date().toISOString()
+    };
+    const updated = [...memories, newMem];
+    setMemories(updated);
+    localStorage.setItem("myraa_dharam_memories", JSON.stringify(updated));
+  };
+
+  const handleUpdateMemory = (id: string, content: string) => {
+    const updated = memories.map(m => m.id === id ? { ...m, content, timestamp: new Date().toISOString() } : m);
+    setMemories(updated);
+    localStorage.setItem("myraa_dharam_memories", JSON.stringify(updated));
+  };
+
+  const handleDeleteMemory = (id: string) => {
+    const updated = memories.filter(m => m.id !== id);
+    setMemories(updated);
+    localStorage.setItem("myraa_dharam_memories", JSON.stringify(updated));
+  };
+
+  const handleClearAllMemories = () => {
+    setMemories([]);
+    localStorage.removeItem("myraa_dharam_memories");
+  };
+
+  const triggerMemoryExtraction = async (explicit = true, customTranscripts?: TranscriptEntry[]) => {
+    if (isExtractingMemories) return;
+    
+    const transcriptsToUse = customTranscripts || transcripts;
+    if (transcriptsToUse.length === 0) {
+      if (explicit) showToast("No conversation history in this session yet!");
+      return;
+    }
+
+    // Rate-limit automated background extraction to conserve API quota.
+    // Each dialogue turn typically produces 2 entries (user and AI).
+    // We only trigger background sync once every ~3 conversational turns (6 entries)
+    if (!explicit && (transcriptsToUse.length - lastExtractedCountRef.current < 6)) {
+      return;
+    }
+
+    setIsExtractingMemories(true);
+    if (explicit) showToast("Scanning conversation history for cognitive linkages...");
+
+    try {
+      const response = await fetch("/api/memory/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recentMessages: transcriptsToUse.slice(-20),
+          currentMemories: memories
+        })
+      });
+
+      const data = await response.json();
+      
+      // Update the extracted count ref on any attempt response to prevent rapid repetitive background calls
+      lastExtractedCountRef.current = transcriptsToUse.length;
+
+      if (data.success) {
+        let updatedList = [...memories];
+        let changed = false;
+        let messages: string[] = [];
+
+        // 1. Process deletions
+        if (Array.isArray(data.deletedMemoryIds) && data.deletedMemoryIds.length > 0) {
+          const originalLength = updatedList.length;
+          updatedList = updatedList.filter(m => m && m.id && !data.deletedMemoryIds.includes(m.id));
+          if (updatedList.length !== originalLength) {
+            changed = true;
+            messages.push(`Removed ${originalLength - updatedList.length} obsolete facts`);
+          }
+        }
+
+        // 2. Process updates
+        if (Array.isArray(data.updatedMemories) && data.updatedMemories.length > 0) {
+          let updateCount = 0;
+          data.updatedMemories.forEach((upm: any) => {
+            if (!upm || !upm.id || typeof upm.content !== "string") return;
+            const idx = updatedList.findIndex(m => m && m.id === upm.id);
+            if (idx !== -1) {
+              updatedList[idx] = {
+                ...updatedList[idx],
+                category: normalizeCategory(upm.category || updatedList[idx].category),
+                content: upm.content,
+                timestamp: new Date().toISOString()
+              };
+              changed = true;
+              updateCount++;
+            }
+          });
+          if (updateCount > 0) {
+            messages.push(`Refined ${updateCount} details`);
+          }
+        }
+
+        // 3. Process new memories
+        if (Array.isArray(data.newMemories) && data.newMemories.length > 0) {
+          data.newMemories.forEach((newm: any) => {
+            if (!newm || typeof newm.content !== "string") return;
+            const contentLower = newm.content.toLowerCase().trim();
+            const exists = updatedList.some(m => m && typeof m.content === "string" && m.content.toLowerCase().trim() === contentLower);
+            if (!exists) {
+              updatedList.push({
+                id: `mem-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+                category: normalizeCategory(newm.category || "other"),
+                content: newm.content,
+                timestamp: new Date().toISOString()
+              });
+              changed = true;
+              messages.push(`Learned: "${newm.content}"`);
+            }
+          });
+        }
+
+        if (changed) {
+          setMemories(updatedList);
+          localStorage.setItem("myraa_dharam_memories", JSON.stringify(updatedList));
+          if (explicit) {
+            if (data.fallbackActive) {
+              showToast(`Heuristics synced! ${messages.join(", ")} (API limit reached)`);
+            } else {
+              showToast(`Cognitive core synced! ${messages.join(", ")}`);
+            }
+          } else {
+            showToast(`🧠 Dharam & Myraa updated their memory database: ${messages[0] || "Learned new facts"}`);
+          }
+        } else {
+          if (explicit) {
+            if (data.fallbackActive) {
+              showToast("Neural core synced via safe local heuristics. (API quota reached)");
+            } else {
+              showToast("Neural core synchronized. No new details detected.");
+            }
+          }
+        }
+      } else {
+        console.warn("Failed to extract memories:", data.error);
+        if (explicit) {
+          if (data.quotaExceeded) {
+            showToast("Gemini daily API limit reached. Add your key in Settings > Secrets to bypass!");
+          } else {
+            showToast("Cognitive sync encountered an issue.");
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Error calling memory extraction API:", err);
+      // Ensure we register this attempt so background calls don't loop infinitely
+      lastExtractedCountRef.current = transcriptsToUse.length;
+      if (explicit) showToast("Network error during cognitive handshake.");
+    } finally {
+      setIsExtractingMemories(false);
+    }
+  };
+
+  // Transcripts state with local storage persistence
+  const [transcripts, setTranscripts] = useState<TranscriptEntry[]>(() => {
+    try {
+      const stored = localStorage.getItem("myraa_dharam_transcripts");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          return parsed.map((entry: any) => ({
+            ...entry,
+            timestamp: new Date(entry.timestamp)
+          }));
+        }
+      }
+    } catch (e) {
+      console.error("Failed to load transcripts from localStorage:", e);
+    }
+    return [];
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("myraa_dharam_transcripts", JSON.stringify(transcripts));
+    } catch (e) {
+      console.error("Failed to save transcripts to localStorage:", e);
+    }
+  }, [transcripts]);
+
   const [activeUserTranscript, setActiveUserTranscript] = useState("");
   const [activeModelTranscript, setActiveModelTranscript] = useState("");
 
@@ -120,6 +347,12 @@ export default function App() {
   const activeUserTranscriptRef = useRef("");
   const activeModelTranscriptRef = useRef("");
   const transcriptsEndRef = useRef<HTMLDivElement | null>(null);
+  const lastExtractedCountRef = useRef(0);
+
+  // Initialize the last extracted transcripts count on mount
+  useEffect(() => {
+    lastExtractedCountRef.current = transcripts.length;
+  }, []);
 
   // Synchronize state values with refs for event callbacks
   useEffect(() => {
@@ -167,6 +400,228 @@ export default function App() {
     const interval = setInterval(updateTime, 60000);
     return () => clearInterval(interval);
   }, []);
+
+  const generateImageInChat = async (prompt: string) => {
+    const loadingId = `model-loading-${Date.now()}`;
+    setTranscripts((prev) => [
+      ...prev,
+      {
+        id: loadingId,
+        sender: "model",
+        text: `🎨 Initiating digital synthesis core for image: "${prompt}"...`,
+        timestamp: new Date()
+      }
+    ]);
+
+    try {
+      const res = await fetch("/api/generate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt })
+      });
+      const data = await res.json();
+      if (data.success && data.imageData) {
+        setTranscripts((prev) => prev.map((entry) => 
+          entry.id === loadingId 
+            ? {
+                ...entry,
+                text: `🎨 Successfully synthesized image for: "${prompt}"`,
+                type: "image",
+                mediaUrl: data.imageData
+              }
+            : entry
+        ));
+        showToast("Image generated successfully!");
+      } else {
+        throw new Error(data.error || "Generation failed");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setTranscripts((prev) => prev.map((entry) => 
+        entry.id === loadingId 
+          ? {
+              ...entry,
+              text: `❌ Image generation failed: ${err.message || err}`
+            }
+          : entry
+      ));
+      showToast("Image generation failed.");
+    }
+  };
+
+  const generateVideoInChat = async (prompt: string) => {
+    const loadingId = `model-loading-${Date.now()}`;
+    setTranscripts((prev) => [
+      ...prev,
+      {
+        id: loadingId,
+        sender: "model",
+        text: `🎥 Loading video engine and rendering pixels for prompt: "${prompt}"...`,
+        timestamp: new Date()
+      }
+    ]);
+
+    try {
+      const res = await fetch("/api/generate-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt })
+      });
+      const data = await res.json();
+      
+      if (data.success) {
+        let done = false;
+        let attempts = 0;
+        const opName = data.operationName;
+        const isFallback = data.isFallback;
+
+        while (!done && attempts < 10) {
+          attempts++;
+          setTranscripts((prev) => prev.map((entry) => 
+            entry.id === loadingId 
+              ? {
+                  ...entry,
+                  text: `🎥 Rendering cinematic frames for prompt: "${prompt}" (${attempts * 10}%)`
+                }
+              : entry
+          ));
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          
+          const statusRes = await fetch("/api/video-status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ operationName: opName, isFallback })
+          });
+          const statusData = await statusRes.json();
+          done = statusData.done;
+        }
+
+        const downloadRes = await fetch("/api/video-download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operationName: opName, isFallback })
+        });
+        const downloadData = await downloadRes.json();
+
+        if (downloadData.videoUrl) {
+          setTranscripts((prev) => prev.map((entry) => 
+            entry.id === loadingId 
+              ? {
+                  ...entry,
+                  text: `🎥 Video rendered successfully for: "${prompt}"`,
+                  type: "video",
+                  mediaUrl: downloadData.videoUrl
+                }
+              : entry
+          ));
+          showToast("Video generated successfully!");
+        } else {
+          throw new Error("No video url received");
+        }
+      } else {
+        throw new Error(data.error || "Video launch failed");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setTranscripts((prev) => prev.map((entry) => 
+        entry.id === loadingId 
+          ? {
+              ...entry,
+              text: `❌ Video rendering failed: ${err.message || err}`
+            }
+          : entry
+      ));
+      showToast("Video generation failed.");
+    }
+  };
+
+  const generateCodeInChat = async (prompt: string) => {
+    const loadingId = `model-loading-${Date.now()}`;
+    setTranscripts((prev) => [
+      ...prev,
+      {
+        id: loadingId,
+        sender: "model",
+        text: `💻 Initializing digital compiler and sandbox for code: "${prompt}"...`,
+        timestamp: new Date()
+      }
+    ]);
+
+    try {
+      const res = await fetch("/api/generate-code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt })
+      });
+      const data = await res.json();
+      if (data.success && data.code) {
+        setTranscripts((prev) => prev.map((entry) => 
+          entry.id === loadingId 
+            ? {
+                ...entry,
+                text: data.code,
+                timestamp: new Date()
+              }
+            : entry
+        ));
+        showToast("Code generated successfully!");
+      } else {
+        throw new Error(data.error || "Generation failed");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setTranscripts((prev) => prev.map((entry) => 
+        entry.id === loadingId 
+          ? {
+              ...entry,
+              text: `❌ Code generation failed: ${err.message || err}`
+            }
+          : entry
+      ));
+      showToast("Code generation failed.");
+    }
+  };
+
+  const renderMessageText = (text: string) => {
+    const parts: ReactNode[] = [];
+    const regex = /```(\w*)\n([\s\S]*?)```/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+      const matchIndex = match.index;
+      if (matchIndex > lastIndex) {
+        parts.push(
+          <span key={`text-${lastIndex}`} className="whitespace-pre-wrap">
+            {text.substring(lastIndex, matchIndex)}
+          </span>
+        );
+      }
+
+      const lang = match[1] || "javascript";
+      const code = match[2];
+      parts.push(
+        <CodeBlock
+          key={`code-${matchIndex}`}
+          code={code}
+          language={lang}
+          onShowToast={showToast}
+        />
+      );
+
+      lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      parts.push(
+        <span key={`text-${lastIndex}`} className="whitespace-pre-wrap">
+          {text.substring(lastIndex)}
+        </span>
+      );
+    }
+
+    return parts.length > 0 ? parts : <span className="whitespace-pre-wrap">{text}</span>;
+  };
 
   // Waveform visualization animation
   const [waveHeights, setWaveHeights] = useState<number[]>(Array(24).fill(4));
@@ -239,8 +694,48 @@ export default function App() {
             timestamp: new Date()
           });
         }
-        return [...prev, ...entries];
+        const updated = [...prev, ...entries];
+        
+        // Auto-extract memories in the background immediately after dialogue turn completes
+        setTimeout(() => {
+          triggerMemoryExtraction(false, updated);
+        }, 1000);
+
+        return updated;
       });
+
+      // VOICE COMMAND ENGINE: Match user spoke transcriptions
+      if (userText) {
+        const lowerText = userText.toLowerCase();
+
+        if (lowerText.includes("generate image") || lowerText.includes("create image") || lowerText.includes("draw image") || lowerText.includes("make image")) {
+          let promptText = userText.replace(/.*?(generate|create|draw|make)\s+image\s*(of|for)?\s*/i, "").trim();
+          if (!promptText) promptText = "A beautiful galactic core";
+          setTimeout(() => {
+            generateImageInChat(promptText);
+          }, 400);
+        }
+        else if (lowerText.includes("generate video") || lowerText.includes("create video") || lowerText.includes("make video")) {
+          let promptText = userText.replace(/.*?(generate|create|make)\s+video\s*(of|for)?\s*/i, "").trim();
+          if (!promptText) promptText = "A beautiful cosmic nebula rotation";
+          setTimeout(() => {
+            generateVideoInChat(promptText);
+          }, 400);
+        }
+        else if (lowerText.includes("generate code") || lowerText.includes("create code") || lowerText.includes("write code") || lowerText.includes("make code") || lowerText.includes("coding for") || lowerText.includes("code for")) {
+          let promptText = userText.replace(/.*?(generate|create|write|make|coding\s+for|code\s+for)\s+code\s*(of|for|about)?\s*/i, "").trim();
+          if (!promptText) promptText = "A beautiful interactive digital clock";
+          setTimeout(() => {
+            generateCodeInChat(promptText);
+          }, 400);
+        }
+        else if (lowerText.includes("song features") || lowerText.includes("search song") || lowerText.includes("song finder") || lowerText.includes("song features finder")) {
+          setTimeout(() => {
+            setShowSongFeatures(true);
+            showToast("Launching Google Song Features Finder via Voice Command...");
+          }, 400);
+        }
+      }
 
       // Clear the active buffers
       setActiveUserTranscript("");
@@ -251,8 +746,10 @@ export default function App() {
   };
 
   // Disconnect active companion session
-  const disconnectSession = () => {
-    setError(null);
+  const disconnectSession = (keepError = false) => {
+    if (!keepError) {
+      setError(null);
+    }
     setConnectionState("disconnected");
 
     // Close websocket
@@ -274,11 +771,85 @@ export default function App() {
     }
 
     commitTranscripts();
+
+    // Trigger automated background memory extraction to save newly learned details
+    setTimeout(() => {
+      triggerMemoryExtraction(false);
+    }, 1200);
   };
 
   // Send typed text messages over the active companion link
   const sendTextMessage = (text: string) => {
     if (!text.trim()) return;
+
+    const lowerText = text.toLowerCase();
+    
+    // Check for smart generator matches using flexible .includes() matching!
+    if (lowerText.includes("generate image") || lowerText.includes("create image") || lowerText.includes("draw image") || lowerText.includes("make image")) {
+      let promptText = text.replace(/.*?(generate|create|draw|make)\s+image\s*(of|for)?\s*/i, "").trim();
+      if (!promptText) promptText = "A beautiful galactic core";
+      // Add user's command message first
+      setTranscripts((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          sender: "user",
+          text: text.trim(),
+          timestamp: new Date()
+        }
+      ]);
+      generateImageInChat(promptText);
+      return;
+    }
+
+    if (lowerText.includes("generate video") || lowerText.includes("create video") || lowerText.includes("make video")) {
+      let promptText = text.replace(/.*?(generate|create|make)\s+video\s*(of|for)?\s*/i, "").trim();
+      if (!promptText) promptText = "A beautiful cosmic nebula rotation";
+      // Add user's command message first
+      setTranscripts((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          sender: "user",
+          text: text.trim(),
+          timestamp: new Date()
+        }
+      ]);
+      generateVideoInChat(promptText);
+      return;
+    }
+
+    if (lowerText.includes("generate code") || lowerText.includes("create code") || lowerText.includes("write code") || lowerText.includes("make code") || lowerText.includes("coding for") || lowerText.includes("code for")) {
+      let promptText = text.replace(/.*?(generate|create|write|make|coding\s+for|code\s+for)\s+code\s*(of|for|about)?\s*/i, "").trim();
+      if (!promptText) promptText = "A beautiful interactive digital clock";
+      // Add user's command message first
+      setTranscripts((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          sender: "user",
+          text: text.trim(),
+          timestamp: new Date()
+        }
+      ]);
+      generateCodeInChat(promptText);
+      return;
+    }
+
+    if (lowerText.includes("song features") || lowerText.includes("search song") || lowerText.includes("song finder") || lowerText.includes("song features finder")) {
+      setTranscripts((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          sender: "user",
+          text: text.trim(),
+          timestamp: new Date()
+        }
+      ]);
+      setShowSongFeatures(true);
+      showToast("Launching Google Song Features Finder...");
+      return;
+    }
     
     // Add user text directly to transcript history for instant visual feedback
     const entryId = `user-${Date.now()}-${Math.random()}`;
@@ -295,6 +866,7 @@ export default function App() {
     // Send to Gemini Live via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ text: text.trim() }));
+      setAnimationState("thinking");
     }
   };
 
@@ -343,9 +915,9 @@ export default function App() {
 
       // 3. Setup WebSocket connection (port 3000)
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/live?character=${characterToUse}`;
+      const wsUrl = `${protocol}//${window.location.host}/live?character=${characterToUse}&memories=${encodeURIComponent(JSON.stringify(memories))}`;
       
-      console.log(`Connecting WebSocket: ${wsUrl}`);
+      console.log(`Connecting WebSocket with ${memories.length} memories: ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -358,7 +930,7 @@ export default function App() {
           } catch (micErr: any) {
             console.error("Microphone permission denied:", micErr);
             setError("Microphone access is required for real-time voice chat.");
-            disconnectSession();
+            disconnectSession(true);
           }
         } else {
           console.log("WebSocket connection established. Text chat mode active.");
@@ -380,7 +952,7 @@ export default function App() {
             }
           } else if (parsed.type === "error") {
             setError(parsed.message || "An unexpected error occurred.");
-            disconnectSession();
+            disconnectSession(true);
           } else if (parsed.type === "gemini") {
             const rawMessage = parsed.data;
 
@@ -396,34 +968,48 @@ export default function App() {
               if (playerRef.current) {
                 playerRef.current.interrupt();
               }
+              commitTranscripts();
               setConnectionState("listening");
             }
 
             // Handle real-time User Speech Transcription
+            let incomingUserText = "";
             const inputTranscription = rawMessage.serverContent?.inputTranscription || rawMessage.serverContent?.inputAudioTranscription;
             if (inputTranscription) {
-              const text = typeof inputTranscription === "string" ? inputTranscription : inputTranscription.text;
-              if (text) {
-                activeUserTranscriptRef.current = text;
-                setActiveUserTranscript(text);
+              const t = typeof inputTranscription === "string" ? inputTranscription : inputTranscription.text;
+              if (t) {
+                incomingUserText = t;
               }
+            }
+            if (incomingUserText) {
+              activeUserTranscriptRef.current = incomingUserText;
+              setActiveUserTranscript(incomingUserText);
+              setAnimationState("thinking");
             }
 
             // Handle real-time AI Voice Transcription
+            let incomingModelText = "";
             const outputTranscription = rawMessage.serverContent?.outputTranscription || rawMessage.serverContent?.outputAudioTranscription;
             if (outputTranscription) {
-              const text = typeof outputTranscription === "string" ? outputTranscription : outputTranscription.text;
-              if (text) {
-                activeModelTranscriptRef.current = text;
-                setActiveModelTranscript(activeModelTranscriptRef.current);
+              const t = typeof outputTranscription === "string" ? outputTranscription : outputTranscription.text;
+              if (t) {
+                incomingModelText = t;
               }
-            } else {
-              // Fallback to modelTurn text parts
-              const partText = rawMessage.serverContent?.modelTurn?.parts?.[0]?.text;
-              if (partText) {
-                activeModelTranscriptRef.current += partText;
-                setActiveModelTranscript(activeModelTranscriptRef.current);
-              }
+            }
+            
+            // Also accumulate any text parts from modelTurn parts array
+            const parts = rawMessage.serverContent?.modelTurn?.parts;
+            if (Array.isArray(parts)) {
+              parts.forEach((part: any) => {
+                if (part?.text) {
+                  incomingModelText += part.text;
+                }
+              });
+            }
+
+            if (incomingModelText) {
+              activeModelTranscriptRef.current += incomingModelText;
+              setActiveModelTranscript(activeModelTranscriptRef.current);
             }
 
             // Turn complete - user and model finished speaking
@@ -447,13 +1033,13 @@ export default function App() {
       ws.onerror = (err) => {
         console.error("WebSocket client error:", err);
         setError("Unable to communicate with the voice server.");
-        disconnectSession();
+        disconnectSession(true);
       };
 
     } catch (err: any) {
       console.error("Failed to connect companion:", err);
       setError(`Failed to connect: ${err.message || err}`);
-      disconnectSession();
+      disconnectSession(true);
     }
   };
 
@@ -594,7 +1180,7 @@ export default function App() {
 
   return (
     <div
-      className="min-h-screen text-gray-200 relative font-sans flex flex-col justify-between"
+      className="min-h-[100dvh] lg:h-screen text-gray-200 relative font-sans flex flex-col justify-between overflow-y-auto lg:overflow-hidden"
       style={{
         backgroundColor: "#050505",
         backgroundImage: `radial-gradient(circle at 50% 50%, ${getThemeGlowColorHex()} 0%, rgba(5, 5, 5, 0) 70%)`
@@ -638,11 +1224,11 @@ export default function App() {
       ></div>
 
       {/* Header bar styled precisely like "Sophisticated Dark" & Image 1 */}
-      <nav className="relative z-10 flex flex-col md:flex-row justify-between items-center px-6 md:px-10 py-5 border-b border-white/5 bg-black/20 backdrop-blur-md gap-4 select-none" id="header-bar">
+      <nav className="sticky top-0 z-40 flex justify-between items-center px-3 sm:px-6 md:px-10 py-2.5 sm:py-3 border-b border-white/5 bg-[#07070a]/85 backdrop-blur-md select-none w-full gap-3" id="header-bar">
         {/* Left: Live status and latency indicator */}
-        <div className="flex items-center space-x-3" id="status-display">
+        <div className="flex items-center space-x-2 sm:space-x-3" id="status-display">
           <div
-            className={`w-2.5 h-2.5 rounded-full animate-pulse transition-all duration-500 ${
+            className={`w-2 h-2 rounded-full animate-pulse transition-all duration-500 ${
               connectionState === "disconnected"
                 ? "bg-red-500 shadow-[0_0_10px_#ef4444]"
                 : connectionState === "connecting"
@@ -650,31 +1236,33 @@ export default function App() {
                 : "bg-cyan-400 shadow-[0_0_15px_#22d3ee]"
             }`}
           ></div>
-          <span className="text-[10px] uppercase tracking-[0.25em] text-zinc-400 font-bold font-mono">
+          <span className="text-[9px] sm:text-[10px] uppercase tracking-wider text-zinc-400 font-bold font-mono">
             {connectionState === "disconnected" ? (
-              <span className="text-red-400/80">SYSTEM DORMANT</span>
+              <span className="text-red-400/80">DORMANT</span>
             ) : connectionState === "connecting" ? (
-              <span className="text-amber-400/80">SYNCHRONIZING LINK...</span>
+              <span className="text-amber-400/80">SYNC...</span>
             ) : (
-              <span className="text-cyan-400">SYSTEM LIVE: SECURE CHANNEL</span>
+              <span className="text-cyan-400">LIVE</span>
             )}
           </span>
+          <span className="text-white/20">|</span>
+          <span className="uppercase text-white/70 font-semibold text-[9px] sm:text-[10px] font-mono">{character === "myraa" ? "Myraa" : "Dharam"} v3.1</span>
         </div>
 
         {/* Middle: Live Latency Pill (Image 1 Style) */}
-        <div className="flex items-center space-x-2 bg-white/[0.03] border border-white/10 px-4 py-1.5 rounded-full text-[10px] font-mono tracking-wider text-zinc-400">
+        <div className="hidden lg:flex items-center space-x-2 bg-white/[0.03] border border-white/10 px-4 py-1.5 rounded-full text-[10px] font-mono tracking-wider text-zinc-400">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
           <span>LATENCY: 42MS</span>
           <span className="text-white/20">|</span>
           <span className="uppercase text-white/70 font-semibold">{character === "myraa" ? "Myraa" : "Dharam"} v3.1</span>
         </div>
 
-        {/* Right: Character Voice & Guide */}
-        <div className="flex items-center space-x-4">
-          <div className="flex bg-white/5 p-0.5 rounded-lg border border-white/10">
+        {/* Right: Character Voice & Guide (Compact & Row-aligned) */}
+        <div className="flex items-center gap-1.5 sm:gap-3">
+          <div className="flex bg-white/5 p-0.5 rounded-lg border border-white/10 text-[9px] sm:text-[10px]">
             <button
               onClick={() => handleCharacterChange("dharam")}
-              className={`px-3 py-1 rounded text-[10px] uppercase tracking-wider transition-all duration-300 cursor-pointer ${
+              className={`px-1.5 sm:px-2.5 py-0.5 sm:py-1 rounded uppercase tracking-wider transition-all duration-300 cursor-pointer ${
                 character === "dharam"
                   ? "bg-white/10 text-white font-bold"
                   : "text-white/40 hover:text-white"
@@ -684,7 +1272,7 @@ export default function App() {
             </button>
             <button
               onClick={() => handleCharacterChange("myraa")}
-              className={`px-3 py-1 rounded text-[10px] uppercase tracking-wider transition-all duration-300 cursor-pointer ${
+              className={`px-1.5 sm:px-2.5 py-0.5 sm:py-1 rounded uppercase tracking-wider transition-all duration-300 cursor-pointer ${
                 character === "myraa"
                   ? "bg-white/10 text-white font-bold"
                   : "text-white/40 hover:text-white"
@@ -696,29 +1284,42 @@ export default function App() {
 
           <button
             onClick={() => setShowTopicsModal(true)}
-            className="flex items-center space-x-1.5 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-3 py-1.5 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
+            className="flex items-center space-x-1 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-2 sm:px-2.5 py-1 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
             id="topics-button"
+            title="Show Topics Guide"
           >
             <HelpCircle className="w-3.5 h-3.5 text-cyan-400/80" />
-            <span className="tracking-wider uppercase">TOPICS</span>
+            <span className="hidden sm:inline tracking-wider uppercase">TOPICS</span>
           </button>
 
           <button
             onClick={() => setShowHistoryModal(true)}
-            className="flex items-center space-x-1.5 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-3 py-1.5 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
+            className="flex items-center space-x-1 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-2 sm:px-2.5 py-1 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
             id="history-button"
+            title="Conversation History"
           >
             <Clock className="w-3.5 h-3.5 text-cyan-400/80" />
-            <span className="tracking-wider uppercase">History</span>
+            <span className="hidden sm:inline tracking-wider uppercase">History</span>
+          </button>
+
+          <button
+            onClick={() => setShowMemoryVault(true)}
+            className="flex items-center space-x-1 bg-emerald-500/10 border border-emerald-500/25 hover:bg-emerald-500/20 text-emerald-300 hover:text-white px-2 sm:px-2.5 py-1 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
+            id="memory-vault-button"
+            title="Neural Memory Vault"
+          >
+            <Brain className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden sm:inline tracking-wider uppercase">Memory Vault</span>
           </button>
 
           <button
             onClick={() => setShowSettingsModal(true)}
-            className="flex items-center space-x-1.5 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-3 py-1.5 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
+            className="flex items-center space-x-1 bg-white/5 border border-white/10 hover:bg-white/10 text-white/80 hover:text-white px-2 sm:px-2.5 py-1 rounded-lg text-[10px] font-medium cursor-pointer transition-colors"
             id="settings-button"
+            title="Application Settings"
           >
             <Settings className="w-3.5 h-3.5 text-cyan-400/80" />
-            <span className="tracking-wider uppercase">Settings</span>
+            <span className="hidden sm:inline tracking-wider uppercase">Settings</span>
           </button>
         </div>
       </nav>
@@ -734,33 +1335,13 @@ export default function App() {
           <p className="text-white/30 text-[10px] uppercase tracking-[0.3em] font-mono">Your Intelligent Companion</p>
         </div>
 
-        {/* Central Orb nested ring capsule system */}
-        <div className="relative flex items-center justify-center h-[260px] md:h-[320px] w-full scale-90 sm:scale-100 transition-all duration-500 py-4" id="orb-visualizer-section">
-          {/* Orbit Ring 1: Outer Dashed Ring (440px) */}
-          <div className="absolute w-[340px] h-[340px] md:w-[420px] md:h-[420px] border border-dashed border-white/5 rounded-full pointer-events-none select-none animate-[spin_45s_linear_infinite]"></div>
-          
-          {/* Orbit Ring 2: Dotted Ring (380px) with reverse rotation */}
-          <div className="absolute w-[280px] h-[280px] md:w-[360px] md:h-[360px] border border-dotted border-white/10 rounded-full animate-[spin_30s_linear_infinite_reverse] pointer-events-none select-none"></div>
-
-          {/* Orbit Ring 3: Solid Accent Ring (320px) */}
-          <div className="absolute w-[230px] h-[230px] md:w-[300px] md:h-[300px] border border-white/5 rounded-full pointer-events-none select-none">
-            {/* Glowing orbit traveller dot on Ring 3 */}
-            <div 
-              className="absolute w-2 h-2 rounded-full -top-1 left-1/2 -ml-1 animate-[ping_2.5s_infinite]"
-              style={{ backgroundColor: getThemeAccentHex() }}
-            ></div>
-          </div>
-          
-          {/* Glowing Inner Backdrop Capsule (280px) */}
-          <div
-            className="absolute w-[200px] h-[200px] md:w-[260px] md:h-[260px] bg-cyan-500/5 rounded-full backdrop-blur-3xl transition-all duration-1000 pointer-events-none select-none"
-            style={{
-              boxShadow: `inset 0 0 50px ${getThemeGlowColorHex()}`
-            }}
-          ></div>
-
-          {/* Core Interactive Capsule Sphere Button */}
-          <button
+        {/* Central Animated Character System */}
+        <div className="relative flex flex-col items-center justify-center w-full min-h-[360px] md:min-h-[480px]" id="character-visualizer-section">
+          <AICharacterVisualizer
+            character={character}
+            animationState={animationState}
+            connectionState={connectionState}
+            activeTheme={activeTheme}
             onClick={
               connectionState === "disconnected"
                 ? () => connectSession(character)
@@ -768,79 +1349,10 @@ export default function App() {
                 ? handleVoiceInterrupt
                 : disconnectSession
             }
-            className={`relative w-40 h-40 md:w-48 md:h-48 rounded-full flex flex-col items-center justify-center border-4 border-black/30 group cursor-pointer transition-all duration-500 hover:scale-105 active:scale-95 outline-none select-none overflow-hidden ${
-              connectionState === "disconnected"
-                ? "bg-zinc-900/90 border-white/10 hover:border-cyan-400/30 hover:shadow-[0_0_45px_rgba(34,211,238,0.25)]"
-                : `bg-gradient-to-tr ${getOrbGradient()}`
-            }`}
-            id="central-circle-button"
-            title={
-              connectionState === "disconnected"
-                ? "Click to start voice companion link"
-                : connectionState === "speaking"
-                ? "Click to interrupt speaking"
-                : "Listening. Click to stop session"
-            }
-          >
-            {/* Ambient inner radial scan glow */}
-            <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle_at_50%_120%,rgba(255,255,255,0.1),transparent_70%)] pointer-events-none"></div>
+          />
 
-            {/* Dynamic Interactive Icon / Label inside Orb (Mixer Style!) */}
-            <div className="transition-all duration-300 flex flex-col items-center text-center px-4" id="central-icon">
-              {connectionState === "disconnected" ? (
-                <>
-                  <span className="text-xl md:text-2xl font-display font-light tracking-wide text-white animate-pulse">
-                    {character === "myraa" ? "Myraa" : "Dharam"}
-                  </span>
-                  <span className="text-[8px] font-mono tracking-[0.25em] text-white/40 uppercase mt-1">DORMANT</span>
-                  {/* Small orbit bottom status dot inside orb */}
-                  <div className="w-1.5 h-1.5 rounded-full bg-white/40 animate-ping mt-3"></div>
-                </>
-              ) : connectionState === "connecting" ? (
-                <>
-                  <Activity className="w-10 h-10 text-black animate-bounce" />
-                  <span className="text-[8px] font-mono tracking-widest text-black/60 uppercase mt-2">SYNCING...</span>
-                </>
-              ) : connectionState === "speaking" ? (
-                <>
-                  {/* Speaker icon show when speaking */}
-                  <Volume2 className="w-12 h-12 text-black animate-pulse scale-110" />
-                  <span className="text-[8px] font-mono tracking-widest text-black/75 uppercase mt-2 font-bold">SPEAKING</span>
-                </>
-              ) : (
-                <>
-                  {/* Microphone or Sparkles based on chatMode */}
-                  {chatMode === "writing" ? (
-                    <>
-                      <Sparkles className="w-12 h-12 text-black animate-pulse" />
-                      <span className="text-[8px] font-mono tracking-widest text-black/75 uppercase mt-2 font-semibold">WRITE MODE</span>
-                    </>
-                  ) : (
-                    <>
-                      <Mic className="w-12 h-12 text-black animate-pulse" />
-                      <span className="text-[8px] font-mono tracking-widest text-black/75 uppercase mt-2 font-semibold">LISTENING</span>
-                    </>
-                  )}
-                </>
-              )}
-            </div>
-
-            {/* Micro active status indicator dot on the orb bottom */}
-            <div
-              className={`absolute bottom-3.5 w-2.5 h-2.5 rounded-full transition-all duration-500 ${
-                connectionState === "disconnected"
-                  ? "bg-zinc-600"
-                  : connectionState === "connecting"
-                  ? "bg-amber-400"
-                  : connectionState === "speaking"
-                  ? "bg-rose-500 shadow-[0_0_10px_#f43f5e]"
-                  : "bg-emerald-400 shadow-[0_0_10px_#10b981]"
-              }`}
-            ></div>
-          </button>
-
-          {/* Floating sound waves visually sitting under the core capsule */}
-          <div className="absolute -bottom-6 flex items-end justify-center space-x-[5px] h-10 w-full max-w-xs" id="waveform-visualizer">
+          {/* Floating sound waves visually sitting under the core character frame */}
+          <div className="absolute bottom-12 flex items-end justify-center space-x-[5px] h-10 w-full max-w-xs z-20 pointer-events-none" id="waveform-visualizer">
             {waveHeights.slice(0, 16).map((height, i) => (
               <div
                 key={i}
@@ -948,7 +1460,62 @@ export default function App() {
                       <span>•</span>
                       <span>{entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
                     </div>
-                    <p className="text-white/90 leading-relaxed font-light text-xs md:text-sm">{entry.text}</p>
+                    {entry.type === "image" ? (
+                      <div className="flex flex-col space-y-2">
+                        <img 
+                          src={entry.mediaUrl} 
+                          alt="Generated Asset" 
+                          className="rounded-lg max-w-full h-auto border border-white/10 bg-black/40"
+                          referrerPolicy="no-referrer"
+                        />
+                        <button
+                          onClick={() => {
+                            const link = document.createElement("a");
+                            link.href = entry.mediaUrl || "";
+                            link.download = `generation_${Date.now()}.png`;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                          }}
+                          className="flex items-center space-x-1 px-3 py-1.5 self-start bg-cyan-500 text-black text-[10px] font-bold uppercase tracking-wider rounded-lg hover:bg-cyan-400 cursor-pointer transition-colors"
+                        >
+                          <ChevronUp className="w-3 h-3 rotate-180" />
+                          <span>Download Image</span>
+                        </button>
+                      </div>
+                    ) : entry.type === "video" ? (
+                      <div className="flex flex-col space-y-2">
+                        <video 
+                          src={entry.mediaUrl} 
+                          controls
+                          className="rounded-lg max-w-full h-auto border border-white/10 bg-black/40"
+                        />
+                        <button
+                          onClick={() => {
+                            const link = document.createElement("a");
+                            link.href = entry.mediaUrl || "";
+                            link.download = `generation_${Date.now()}.mp4`;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                          }}
+                          className="flex items-center space-x-1 px-3 py-1.5 self-start bg-cyan-500 text-black text-[10px] font-bold uppercase tracking-wider rounded-lg hover:bg-cyan-400 cursor-pointer transition-colors"
+                        >
+                          <ChevronUp className="w-3 h-3 rotate-180" />
+                          <span>Download Video</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="text-white/90 leading-relaxed font-light text-xs md:text-sm">
+                        {entry.text && entry.text.trim() ? (
+                          renderMessageText(entry.text)
+                        ) : (
+                          <span className="italic opacity-60 flex items-center gap-1.5 font-mono text-[11px]">
+                            {entry.sender === "user" ? "🗣️ [Voice Transmission]" : "🔊 [Voice Response]"}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
 
@@ -992,7 +1559,34 @@ export default function App() {
 
         {/* Text message input for Writing and Hybrid modes */}
         {(chatMode === "writing" || chatMode === "hybrid") && (
-          <div className="w-full max-w-xl px-4 mt-5 animate-fade-in z-10" id="text-input-panel">
+          <div className="w-full max-w-xl px-4 mt-4 animate-fade-in z-10" id="text-input-panel">
+            {/* Creator & Game Hub Row */}
+            <div className="flex items-center justify-center gap-1.5 mb-2.5 overflow-x-auto py-1.5 select-none scrollbar-none" id="creator-chips-row">
+              <button
+                type="button"
+                onClick={() => setShowCreativeStudio(true)}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-gradient-to-r from-cyan-500/10 to-indigo-500/10 border border-cyan-500/20 hover:border-cyan-400/50 hover:bg-white/[0.08] rounded-full text-[10px] font-mono uppercase tracking-wider text-cyan-300 hover:text-white cursor-pointer transition-all animate-pulse"
+              >
+                <span>🎨 Creative Studio</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowMemoryVault(true)}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-emerald-500/10 border border-emerald-500/20 hover:border-emerald-400/40 hover:bg-emerald-500/20 rounded-full text-[10px] font-mono uppercase tracking-wider text-emerald-300 hover:text-white cursor-pointer transition-all"
+              >
+                <span>🧠 Memory Vault</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowSongFeatures(true)}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-white/[0.02] border border-white/10 hover:border-emerald-400/40 hover:bg-white/[0.08] rounded-full text-[10px] font-mono uppercase tracking-wider text-white/70 hover:text-white cursor-pointer transition-all"
+              >
+                <span>🔍 Song Features</span>
+              </button>
+            </div>
+
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -1172,8 +1766,8 @@ export default function App() {
 
       {/* HISTORY MODAL OVERLAY */}
       {showHistoryModal && (
-        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-fade-in" id="history-modal">
-          <div className="bg-[#0b0b0e] border border-white/10 max-w-lg w-full rounded-2xl p-6 shadow-2xl relative flex flex-col max-h-[85vh]" id="history-modal-content">
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-4 animate-fade-in" id="history-modal">
+          <div className="bg-[#0b0b0e] border border-white/10 max-w-lg w-full rounded-2xl p-4 sm:p-6 shadow-2xl relative flex flex-col max-h-[90vh]" id="history-modal-content">
             <button
               onClick={() => setShowHistoryModal(false)}
               className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors cursor-pointer"
@@ -1184,10 +1778,24 @@ export default function App() {
             <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-3">
               <div className="flex items-center space-x-2.5">
                 <Clock className={`w-5 h-5 ${getThemeTextClass()}`} />
-                <h3 className="text-lg font-display tracking-wide font-medium text-white">Conversation History</h3>
+                <h3 className="text-base sm:text-lg font-display tracking-wide font-medium text-white">Conversation History</h3>
               </div>
               {transcripts.length > 0 && (
                 <div className="flex items-center space-x-2">
+                  <button
+                    onClick={() => {
+                      const fullChatText = transcripts.map((entry) => {
+                        const label = entry.sender === "user" ? "I SPEAK" : "AI SPEAK";
+                        return `${label} (${entry.timestamp.toLocaleTimeString()}):\n${entry.text}`;
+                      }).join("\n\n");
+                      navigator.clipboard.writeText(fullChatText);
+                      showToast("All chat history copied to clipboard!");
+                    }}
+                    className="text-[9px] sm:text-[10px] font-mono text-cyan-400 hover:text-cyan-300 uppercase tracking-wider bg-cyan-950/30 px-2 sm:px-2.5 py-1 border border-cyan-500/20 rounded-lg transition-colors cursor-pointer mr-1"
+                    title="Copy all conversation transcripts"
+                  >
+                    📋 Copy
+                  </button>
                   {showClearConfirm ? (
                     <>
                       <button
@@ -1196,13 +1804,13 @@ export default function App() {
                           setShowClearConfirm(false);
                           showToast("Conversation history cleared.");
                         }}
-                        className="text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-wider bg-red-950/40 px-2.5 py-1 border border-red-500/30 rounded-lg transition-colors cursor-pointer font-bold"
+                        className="text-[9px] sm:text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-wider bg-red-950/40 px-2 sm:px-2.5 py-1 border border-red-500/30 rounded-lg transition-colors cursor-pointer font-bold"
                       >
                         Confirm!
                       </button>
                       <button
                         onClick={() => setShowClearConfirm(false)}
-                        className="text-[10px] font-mono text-zinc-400 hover:text-white uppercase tracking-wider bg-white/5 hover:bg-white/10 px-2 py-1 border border-white/10 rounded-lg transition-colors cursor-pointer"
+                        className="text-[9px] sm:text-[10px] font-mono text-zinc-400 hover:text-white uppercase tracking-wider bg-white/5 hover:bg-white/10 px-1.5 sm:px-2 py-1 border border-white/10 rounded-lg transition-colors cursor-pointer"
                       >
                         Cancel
                       </button>
@@ -1210,52 +1818,148 @@ export default function App() {
                   ) : (
                     <button
                       onClick={() => setShowClearConfirm(true)}
-                      className="text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-wider bg-red-950/25 px-2.5 py-1 border border-red-500/20 rounded-lg transition-colors cursor-pointer"
+                      className="text-[9px] sm:text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-wider bg-red-950/25 px-2 sm:px-2.5 py-1 border border-red-500/20 rounded-lg transition-colors cursor-pointer"
                     >
-                      Clear All
+                      Clear
                     </button>
                   )}
                 </div>
               )}
             </div>
 
-            <p className="text-xs text-white/40 mb-4 font-light">
+            <p className="text-[11px] sm:text-xs text-white/40 mb-3 sm:mb-4 font-light">
               Full transcript log of your active session. You can scroll through your previous messages below.
             </p>
 
             {/* Conversation list */}
-            <div className="flex-grow overflow-y-auto space-y-4 custom-scrollbar pr-1 mb-6 max-h-[50vh]" id="history-modal-list">
-              {transcripts.length === 0 ? (
+            <div className="flex-grow overflow-y-auto space-y-4 custom-scrollbar p-3 mb-4 max-h-[55vh] flex flex-col bg-[#0b141a] rounded-xl border border-white/5 w-full overflow-x-hidden" id="history-modal-list">
+              {transcripts.length === 0 && !activeUserTranscript && !activeModelTranscript ? (
                 <div className="text-center py-16 italic font-light font-mono text-xs text-white/20">
                   "No voice or text transmissions recorded in this session yet."
                 </div>
               ) : (
-                transcripts.map((entry) => {
-                  const isUser = entry.sender === "user";
-                  return (
-                    <div 
-                      key={entry.id}
-                      className={`p-4 rounded-xl border transition-all duration-300 ${
-                        isUser 
-                          ? "bg-white/[0.02] border-white/10 ml-8" 
-                          : "bg-black/30 border-white/5 mr-8"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between mb-1.5">
-                        <span className={`text-[10px] font-mono font-bold tracking-widest uppercase ${isUser ? "text-cyan-400" : "text-purple-400"}`}>
-                          {isUser ? "I SPEAK" : "AI SPEAK"}
-                        </span>
-                        <span className="text-[9px] font-mono text-zinc-500">
-                          {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                        </span>
+                <>
+                  {transcripts.map((entry) => {
+                    const isUser = entry.sender === "user";
+                    return (
+                      <div 
+                        key={entry.id}
+                        className={`p-3.5 rounded-2xl shadow-md transition-all duration-300 max-w-[95%] sm:max-w-[85%] md:max-w-[80%] break-words overflow-hidden ${
+                          isUser 
+                            ? "bg-[#005c4b] text-white self-end ml-4 md:ml-10 rounded-tr-none border border-[#005c4b]/40 shadow-[0_1px_2px_rgba(0,0,0,0.3)] animate-bubble-slide-in" 
+                            : "bg-[#202c33] text-white self-start mr-4 md:mr-10 rounded-tl-none border border-[#202c33]/40 shadow-[0_1px_2px_rgba(0,0,0,0.3)] animate-bubble-slide-in"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1.5 gap-4 select-none pb-1 border-b border-white/5">
+                          <div className="flex items-center space-x-1.5 text-[9px] font-mono font-bold tracking-wider uppercase">
+                            {isUser ? (
+                              <>
+                                <User className="w-3 h-3 text-emerald-300" />
+                                <span className="text-emerald-300 font-bold">You</span>
+                              </>
+                            ) : (
+                              <>
+                                <Bot className={`w-3 h-3 ${getThemeTextClass()}`} />
+                                <span className={`font-bold ${getThemeTextClass()}`}>{character === "myraa" ? "Myraa" : "Dharam"}</span>
+                              </>
+                            )}
+                          </div>
+                          <span className="text-[9px] font-mono text-white/40">
+                            {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                          </span>
+                        </div>
+                        
+                        {entry.type === "image" ? (
+                          <div className="flex flex-col space-y-2 max-w-full pt-1">
+                            <img 
+                              src={entry.mediaUrl} 
+                              alt="Generated Asset" 
+                              className="rounded-lg max-w-full h-auto border border-white/10"
+                              referrerPolicy="no-referrer"
+                            />
+                            <button
+                              onClick={() => {
+                                const link = document.createElement("a");
+                                link.href = entry.mediaUrl || "";
+                                link.download = `generation_${Date.now()}.png`;
+                                document.body.appendChild(link);
+                                link.click();
+                                document.body.removeChild(link);
+                              }}
+                              className="flex items-center space-x-1 px-3 py-1.5 self-start bg-emerald-500 text-black text-[10px] font-bold uppercase tracking-wider rounded-lg hover:bg-emerald-400 cursor-pointer transition-colors"
+                            >
+                              <ChevronUp className="w-3 h-3 rotate-180" />
+                              <span>Download Image</span>
+                            </button>
+                          </div>
+                        ) : entry.type === "video" ? (
+                          <div className="flex flex-col space-y-2 max-w-full pt-1">
+                            <video 
+                              src={entry.mediaUrl} 
+                              controls
+                              className="rounded-lg max-w-full h-auto border border-white/10"
+                            />
+                            <button
+                              onClick={() => {
+                                const link = document.createElement("a");
+                                link.href = entry.mediaUrl || "";
+                                link.download = `generation_${Date.now()}.mp4`;
+                                document.body.appendChild(link);
+                                link.click();
+                                document.body.removeChild(link);
+                              }}
+                              className="flex items-center space-x-1 px-3 py-1.5 self-start bg-emerald-500 text-black text-[10px] font-bold uppercase tracking-wider rounded-lg hover:bg-emerald-400 cursor-pointer transition-colors"
+                            >
+                              <ChevronUp className="w-3 h-3 rotate-180" />
+                              <span>Download Video</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="text-sm text-white/95 leading-relaxed font-normal break-words overflow-hidden w-full pt-0.5">
+                            {entry.text && entry.text.trim() ? (
+                              <span className="font-normal">{renderMessageText(entry.text)}</span>
+                            ) : (
+                              <span className="italic opacity-60 flex items-center gap-1.5 font-mono text-[10px]">
+                                {entry.sender === "user" ? "🗣️ [Voice Transmission]" : "🔊 [Voice Response]"}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {/* Active real-time speech uncommitted indicators shown inside the history modal */}
+                  {activeUserTranscript && (
+                    <div className="p-3.5 rounded-2xl shadow-md bg-[#005c4b]/60 text-white self-end ml-4 md:ml-10 rounded-tr-none border border-emerald-500/25 animate-pulse max-w-[95%] sm:max-w-[85%] break-words">
+                      <div className="flex items-center justify-between mb-1.5 gap-4 select-none pb-1 border-b border-white/5">
+                        <div className="flex items-center space-x-1.5 text-[9px] font-mono font-bold tracking-wider uppercase text-emerald-300">
+                          <User className="w-3 h-3 text-emerald-300" />
+                          <span>You (Speaking...)</span>
+                        </div>
+                        <span className="text-[9px] font-mono text-emerald-300/60 font-bold uppercase">Live</span>
                       </div>
                       <p className="text-sm text-white/90 leading-relaxed font-light">
-                        <span className="font-medium text-cyan-300">{isUser ? "i speak: " : "ai speak: "}</span>
-                        <span className="font-normal text-cyan-50">{entry.text}</span>
+                        "{activeUserTranscript}"
                       </p>
                     </div>
-                  );
-                })
+                  )}
+
+                  {activeModelTranscript && (
+                    <div className="p-3.5 rounded-2xl shadow-md bg-[#202c33]/60 text-white self-start mr-4 md:mr-10 rounded-tl-none border border-cyan-500/25 animate-pulse max-w-[95%] sm:max-w-[85%] break-words">
+                      <div className="flex items-center justify-between mb-1.5 gap-4 select-none pb-1 border-b border-white/5">
+                        <div className="flex items-center space-x-1.5 text-[9px] font-mono font-bold tracking-wider uppercase text-cyan-300">
+                          <Bot className={`w-3 h-3 ${getThemeTextClass()}`} />
+                          <span>{character === "myraa" ? "Myraa" : "Dharam"} (Speaking...)</span>
+                        </div>
+                        <span className="text-[9px] font-mono text-cyan-300/60 font-bold uppercase">Live</span>
+                      </div>
+                      <p className="text-sm text-white/90 leading-relaxed font-light">
+                        "{activeModelTranscript}"
+                      </p>
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -1375,6 +2079,115 @@ export default function App() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* CUSTOM CREATION PROMPT MODAL */}
+      {promptModalConfig?.isOpen && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-[#0b0c10] border border-white/10 max-w-md w-full rounded-2xl p-6 shadow-2xl relative">
+            <button
+              onClick={() => setPromptModalConfig(null)}
+              className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center space-x-2.5 mb-4">
+              <Sparkles className="w-5 h-5 text-cyan-400" />
+              <h3 className="text-lg font-display tracking-wide font-medium">{promptModalConfig.title}</h3>
+            </div>
+
+            <textarea
+              value={customPromptText}
+              onChange={(e) => setCustomPromptText(e.target.value)}
+              placeholder={promptModalConfig.placeholder}
+              rows={3}
+              className="w-full bg-white/[0.03] border border-white/10 rounded-xl p-3 text-xs text-white placeholder-white/25 focus:outline-none focus:border-cyan-500/50 transition-colors mb-4 resize-none"
+            />
+
+            <div className="flex space-x-2">
+              <button
+                onClick={() => setPromptModalConfig(null)}
+                className="flex-1 text-center py-2 border border-white/10 rounded-xl text-white/60 hover:text-white text-xs cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (customPromptText.trim()) {
+                    if (promptModalConfig.type === "image") {
+                      generateImageInChat(customPromptText.trim());
+                    } else if (promptModalConfig.type === "video") {
+                      generateVideoInChat(customPromptText.trim());
+                    } else {
+                      const lang = customPromptText.toLowerCase().includes("html") ? "html" : customPromptText.toLowerCase().includes("css") ? "css" : "javascript";
+                      let sampleCode = "";
+                      if (lang === "html") {
+                        sampleCode = `<!DOCTYPE html>\n<html>\n<body style="background:linear-gradient(to right, #00c6ff, #0072ff); display:flex; justify-content:center; align-items:center; height:100vh; color:white; font-family:sans-serif;">\n  <div style="text-align:center;">\n    <h1>⚡ Cool Live Clock!</h1>\n    <h2 id="time">00:00:00</h2>\n  </div>\n  <script>\n    setInterval(() => {\n      document.getElementById('time').innerText = new Date().toLocaleTimeString();\n    }, 1000);\n  </script>\n</body>\n</html>`;
+                      } else if (lang === "css") {
+                        sampleCode = `.preview-target {\n  background: linear-gradient(45deg, #f06, #9f0);\n  border-radius: 50%;\n  width: 100px;\n  height: 100px;\n  animation: spin 3s linear infinite;\n}\n@keyframes spin {\n  100% { transform: rotate(360deg); }\n}`;
+                      } else {
+                        sampleCode = `console.log("Hello from Javascript!");\nconst sum = (a, b) => a + b;\nconsole.log("The sum of 5 and 7 is: " + sum(5, 7));\nconsole.log("System parameters operating at full strength!");`;
+                      }
+                      setTranscripts((prev) => [
+                        ...prev,
+                        {
+                          id: `user-${Date.now()}`,
+                          sender: "user",
+                          text: `Write ${lang.toUpperCase()} code for: "${customPromptText.trim()}"`,
+                          timestamp: new Date()
+                        },
+                        {
+                          id: `model-${Date.now()}`,
+                          sender: "model",
+                          text: `Here is the requested ${lang.toUpperCase()} code block representing: "${customPromptText.trim()}"\n\`\`\`${lang}\n${sampleCode}\n\`\`\``,
+                          timestamp: new Date()
+                        }
+                      ]);
+                    }
+                  }
+                  setPromptModalConfig(null);
+                  setCustomPromptText("");
+                }}
+                className="flex-1 text-center py-2 rounded-xl text-black font-semibold text-xs cursor-pointer"
+                style={{ backgroundColor: getThemeAccentHex() }}
+              >
+                Generate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GOOGLE SONG FEATURES FINDER MODAL */}
+      {showSongFeatures && (
+        <SongFeaturesSearch 
+          onClose={() => setShowSongFeatures(false)} 
+          onShowToast={showToast} 
+        />
+      )}
+
+      {/* CREATIVE AI MULTI-GENERATOR & CODE RUNNER STUDIO */}
+      {showCreativeStudio && (
+        <CreativeStudio 
+          onClose={() => setShowCreativeStudio(false)} 
+          onShowToast={showToast} 
+        />
+      )}
+
+      {/* NEURAL LONG-TERM COGNITIVE MEMORY VAULT MODAL */}
+      {showMemoryVault && (
+        <MemoryVault
+          onClose={() => setShowMemoryVault(false)}
+          onShowToast={showToast}
+          memories={memories}
+          onAddMemory={handleAddMemory}
+          onUpdateMemory={handleUpdateMemory}
+          onDeleteMemory={handleDeleteMemory}
+          onClearAllMemories={handleClearAllMemories}
+          isExtracting={isExtractingMemories}
+          onTriggerExtract={() => triggerMemoryExtraction(true)}
+        />
       )}
 
       {/* Dynamic Floating Toast Notification */}

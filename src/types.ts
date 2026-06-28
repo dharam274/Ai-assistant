@@ -18,4 +18,7 @@ export interface TranscriptEntry {
   sender: "user" | "model";
   text: string;
   timestamp: Date;
+  type?: "text" | "image" | "video" | "code";
+  mediaUrl?: string;
+  codeLanguage?: string;
 }
